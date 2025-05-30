@@ -24,15 +24,14 @@ const (
 )
 
 type WorkflowEngine struct {
-	storage      *storage.Client
-	definitions  map[string]*types.WorkflowDefinition
-	mu           sync.RWMutex
-	ctx          context.Context
-	taskStream   jetstream.Stream
-	resultStream jetstream.Stream
-	taskKV       jetstream.KeyValue
-	// Holds workflow instance statuses, engine API Writes here, Orchestrator reads here
-	workflowKV jetstream.KeyValue
+	storage            *storage.Client
+	definitions        map[string]*types.WorkflowDefinition
+	mu                 sync.RWMutex
+	ctx                context.Context
+	taskStream         jetstream.Stream
+	resultStream       jetstream.Stream
+	taskKV             jetstream.KeyValue
+	workflowInstanceKV jetstream.KeyValue
 }
 
 // TODO: use some logging code that supports output logger detail (which line, fn, etc.)
@@ -116,7 +115,7 @@ func (e *WorkflowEngine) initializeKVs() error {
 		return fmt.Errorf("failed to create JetStream KV: %w", err)
 	}
 
-	e.workflowKV = workflowKV
+	e.workflowInstanceKV = workflowKV
 	return nil
 }
 
@@ -348,13 +347,16 @@ func (e *WorkflowEngine) prepareTaskInputFromDependencies(workflow *types.Workfl
 		return
 	}
 
+	if task.Input == nil {
+		task.Input = make(map[string]any, 0)
+	}
+
 	// Merge outputs from all dependencies
 	for _, depName := range activityDef.Dependencies {
 		for _, depTask := range workflow.Tasks {
 			if depTask.ActivityName == depName && depTask.State == types.TaskStateCompleted && depTask.Output != nil {
 				// Merge output from this dependency into the task input
 				for k, v := range depTask.Output {
-					// Don't override existing values unless they're empty interfaces
 					if _, exists := task.Input[k]; !exists {
 						task.Input[k] = v
 					}
@@ -535,13 +537,13 @@ func (e *WorkflowEngine) saveWorkflow(workflow *types.WorkflowInstance) error {
 	if err != nil || data == nil {
 		return fmt.Errorf("error serializing data %v: %w", data, err)
 	}
-	e.workflowKV.Put(e.ctx, workflow.ID, data)
+	e.workflowInstanceKV.Put(e.ctx, workflow.ID, data)
 	return nil
 }
 
 // GetWorkflow retrieves a workflow by ID
 func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance, error) {
-	entry, err := e.workflowKV.Get(e.ctx, workflowID)
+	entry, err := e.workflowInstanceKV.Get(e.ctx, workflowID)
 
 	if err != nil || entry == nil || entry.Value() == nil {
 		return nil, fmt.Errorf("error retrieving workflow %v instance: %w", workflowID, err)
@@ -555,7 +557,7 @@ func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance
 // ListWorkflows retrieves all workflows
 func (e *WorkflowEngine) ListWorkflows() ([]*types.WorkflowInstance, error) {
 
-	keyLister, err := e.workflowKV.ListKeys(e.ctx, nil)
+	keyLister, err := e.workflowInstanceKV.ListKeys(e.ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching key list: %w", err)
 	}
