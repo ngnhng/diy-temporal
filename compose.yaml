@@ -1,0 +1,162 @@
+services:
+  # Traefik as reverse proxy, load balancer and TLS termination
+  traefik:
+    image: traefik:v3
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.nats.address=:4222"
+      # Enable dashboard
+      - "--api.insecure=true"
+      - "--api.dashboard=true"
+      # Generate self-signed certs for development
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.myresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      - "--certificatesresolvers.myresolver.acme.email=admin@example.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "4222:4222" # Public NATS port
+      - "8080:8080" # Dashboard
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "letsencrypt-data:/letsencrypt"
+    labels:
+      - "traefik.enable=true"
+      # Dashboard
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.localhost`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.entrypoints=web"
+    profiles:
+      - traefik
+      - nats-ha
+
+  nats-1:
+    image: nats:2.11-alpine
+    command:
+      - "--jetstream"
+      - "-sd"
+      - "/data"
+      - "--cluster_name"
+      - "NATS"
+      - "--http_port"
+      - "8222"
+    volumes:
+      - ./config/nats/server-1:/etc/nats
+      - nats-data-1:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.nats.rule=HostSNI(`nats.localhost`)"
+      - "traefik.tcp.routers.nats.entrypoints=nats"
+      - "traefik.tcp.routers.nats.service=nats-service"
+      - "traefik.tcp.services.nats-service.loadbalancer.server.port=4222"
+    ports:
+      - "4222:4222" # Public NATS port
+      - "8222:8222" # Monitoring port
+    profiles:
+      - nats
+      - nats-ha
+
+  nats-2:
+    image: nats:2.11-alpine
+    command:
+      - "--jetstream"
+      - "-sd"
+      - "/data"
+    volumes:
+      - ./config/nats/server-2:/etc/nats
+      - nats-data-2:/data
+    profiles:
+      - nats-ha
+
+  nats-3:
+    image: nats:2.11-alpine
+    command:
+      - "--jetstream"
+      - "-sd"
+      - "/data"
+    volumes:
+      - ./config/nats/server-3:/etc/nats
+      - nats-data-3:/data
+    profiles:
+      - nats-ha
+
+  auth-service:
+    image: auth:latest
+    depends_on:
+      - nats-1
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:4222
+      - JWT_SECRET=${JWT_SECRET:-changeme}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=Host(`auth.localhost`)"
+      - "traefik.http.routers.auth.entrypoints=web"
+      - "traefik.http.services.auth.loadbalancer.server.port=8080"
+    profiles:
+      - svc
+      - auth
+
+  api-1:
+    image: api:latest
+    depends_on:
+      - nats-1
+      - auth-service
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:4222
+      - AUTH_SERVICE_URL=http://auth-service:8080
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`api.localhost`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.services.api.loadbalancer.server.port=8080"
+    profiles:
+      - svc
+
+  api-2:
+    image: api:latest
+    depends_on:
+      - nats-1
+      - auth-service
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:4222
+      - AUTH_SERVICE_URL=http://auth-service:8080
+    profiles:
+      - svc
+
+  # Workflow Engine
+  workflow-engine-1:
+    image: engine:latest
+    depends_on:
+      - nats-1
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:4222
+      - STATE_STORE_DIR=/data/state
+    volumes:
+      - engine-data-1:/data/state
+    profiles:
+      - svc
+
+  workflow-engine-2:
+    image: engine:latest
+    depends_on:
+      - nats-1
+    environment:
+      - NATS_URL=nats://nats-1:4222,nats://nats-2:4222,nats://nats-3:4222
+      - STATE_STORE_DIR=/data/state
+    volumes:
+      - engine-data-2:/data/state
+    profiles:
+      - svc
+
+volumes:
+  nats-data-1:
+  nats-data-2:
+  nats-data-3:
+  engine-data-1:
+  engine-data-2:
+  letsencrypt-data:
