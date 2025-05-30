@@ -1,716 +1,534 @@
 package engine
 
 import (
-	"app/model"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"maps"
+
 	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	storage "github.com/ngnhng/diy-temporal/nats"
+	"github.com/ngnhng/diy-temporal/types"
 )
 
-// Common error definitions
-var (
-	ErrWorkflowNotFound      = errors.New("workflow not found")
-	ErrWorkflowAlreadyExists = errors.New("workflow already exists with this ID")
-	ErrInvalidWorkflowState  = errors.New("invalid workflow state")
-	ErrTaskQueueNotFound     = errors.New("task queue not found")
-)
-
-type (
-	// Engine is the central workflow execution orchestrator
-	Engine struct {
-		// Configuration options
-		config Config
-
-		// Registration and execution data
-		workflows         map[string]*model.WorkflowDefinition
-		workflowInstances map[string]*WorkflowInstance
-		taskQueues        map[string]*TaskQueue
-
-		// NATS connection for state persistence and pub/sub
-		natsConn *nats.Conn
-
-		// Engine state
-		isRunning bool
-		stopCh    chan struct{}
-
-		// Concurrency controls
-		mu         sync.RWMutex
-		instanceMu sync.RWMutex
-	}
-
-	// Config holds configuration options for the workflow engine
-	Config struct {
-		// NATS connection details
-		NatsURL   string
-		ClusterID string
-
-		// Engine settings
-		MaxConcurrentExecutions int
-		StateCheckInterval      time.Duration
-		TaskTimeout             time.Duration
-	}
-
-	// WorkflowInstance represents a running workflow
-	WorkflowInstance struct {
-		ID           string
-		RunID        string
-		WorkflowType string
-		Status       WorkflowStatus
-		State        interface{} // Current state of the workflow
-		Input        interface{} // Initial input
-		Result       interface{} // Final result when completed
-		Error        error       // Error if failed
-		TaskQueue    string      // Queue this workflow is assigned to
-		StartedAt    time.Time
-		CompletedAt  time.Time
-		History      []HistoryEvent
-	}
-
-	// TaskQueue represents a queue where workers poll for tasks
-	TaskQueue struct {
-		Name      string
-		Workers   []string // Worker IDs connected to this queue
-		TaskCount int      // Number of pending tasks
-	}
-
-	// WorkflowStatus represents the current status of a workflow instance
-	WorkflowStatus string
-
-	// HistoryEvent represents a significant event in the workflow execution
-	HistoryEvent struct {
-		EventType  string
-		EventID    int64
-		Timestamp  time.Time
-		Attributes interface{} // Event-specific data
-	}
-
-	// RegisteredWorker represents a worker instance that has registered with the engine
-	RegisteredWorker struct {
-		ID            string    // Unique identifier for the worker
-		TaskQueue     string    // Task queue this worker listens on
-		Workflows     []string  // Workflow types this worker can handle
-		Activities    []string  // Activity types this worker can handle
-		RegisteredAt  time.Time // When this worker registered
-		LastHeartbeat time.Time // Last heartbeat received from this worker
-	}
-
-	// TaskResult represents the result of a task execution
-	TaskResult struct {
-		TaskID     string      `json:"taskId"`
-		WorkflowID string      `json:"workflowId"`
-		RunID      string      `json:"runId"`
-		Result     interface{} `json:"result,omitempty"`
-		Error      string      `json:"error,omitempty"`
-		Timestamp  int64       `json:"timestamp"`
-	}
-)
-
-// WorkflowStatus constants
 const (
-	WorkflowStatusCreated    WorkflowStatus = "CREATED"
-	WorkflowStatusRunning    WorkflowStatus = "RUNNING"
-	WorkflowStatusCompleted  WorkflowStatus = "COMPLETED"
-	WorkflowStatusFailed     WorkflowStatus = "FAILED"
-	WorkflowStatusCanceled   WorkflowStatus = "CANCELED"
-	WorkflowStatusTerminated WorkflowStatus = "TERMINATED"
+	TaskQueueSubject   = "workflow.tasks"
+	ResultQueueSubject = "workflow.results"
+	WorkflowStreamName = "WORKFLOWS"
+	TaskConsumerName   = "task-processor"
+	ResultConsumerName = "result-processor"
 )
 
-// NewEngine creates a new workflow engine instance
-func NewEngine(config Config) *Engine {
-	// Set reasonable defaults
-	if config.MaxConcurrentExecutions <= 0 {
-		config.MaxConcurrentExecutions = 100
-	}
-	if config.StateCheckInterval <= 0 {
-		config.StateCheckInterval = 5 * time.Second
-	}
-	if config.TaskTimeout <= 0 {
-		config.TaskTimeout = 30 * time.Second
-	}
+type WorkflowEngine struct {
+	storage      *storage.Client
+	definitions  map[string]*types.WorkflowDefinition
+	mu           sync.RWMutex
+	ctx          context.Context
+	taskStream   jetstream.Stream
+	resultStream jetstream.Stream
+	taskKV       jetstream.KeyValue
+	// Holds workflow definitions, engine API Writes here, Orchestrator reads here
+	workflowKV jetstream.KeyValue
+}
 
-	nc, err := nats.Connect(config.NatsURL)
+// TODO: use some logging code that supports output logger detail (which line, fn, etc.)
+func NewWorkflowEngine(ctx context.Context, natsURL string) (*WorkflowEngine, error) {
+	store, err := storage.NewClient(ctx)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
-	return &Engine{
-		config:            config,
-		workflows:         make(map[string]*model.WorkflowDefinition),
-		workflowInstances: make(map[string]*WorkflowInstance),
-		taskQueues:        make(map[string]*TaskQueue),
-		stopCh:            make(chan struct{}),
-		natsConn:          nc,
+	engine := &WorkflowEngine{
+		storage:     store,
+		definitions: make(map[string]*types.WorkflowDefinition),
+		ctx:         ctx,
 	}
+
+	// Initialize streams
+	if err := engine.initializeStreams(); err != nil {
+		return nil, fmt.Errorf("failed to initialize streams: %w", err)
+	}
+
+	// Initialzie KVs
+	if err := engine.initializeKVs(); err != nil {
+		return nil, fmt.Errorf("failed to initialize KVs: %w", err)
+	}
+
+	// Start result processor
+	go engine.processResults()
+
+	return engine, nil
 }
 
-// Start initializes and starts the workflow engine
-func (e *Engine) Start(ctx context.Context) error {
+func (e *WorkflowEngine) initializeStreams() error {
+	// Create task stream
+	taskStream, err := e.storage.EnsureStream(e.ctx, jetstream.StreamConfig{
+		Name:       "TASKS",
+		Subjects:   []string{TaskQueueSubject, TaskQueueSubject + ".>"},
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.WorkQueuePolicy,
+		MaxAge:     24 * time.Hour,
+		Duplicates: 5 * time.Minute,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create task stream: %w", err)
+	}
+	e.taskStream = taskStream
+
+	// Create result stream
+	resultStream, err := e.storage.EnsureStream(e.ctx, jetstream.StreamConfig{
+		Name:       "RESULTS",
+		Subjects:   []string{ResultQueueSubject},
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		MaxAge:     24 * time.Hour,
+		Duplicates: 5 * time.Minute,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create result stream: %w", err)
+	}
+	e.resultStream = resultStream
+
+	return nil
+}
+
+func (e *WorkflowEngine) initializeKVs() error {
+	taskKV, err := e.storage.EnsureKV(e.ctx, jetstream.KeyValueConfig{
+		Bucket:      "tasks",
+		Description: "Executing activity instance storage",
+		TTL:         1 * time.Hour, // TODO: do I even need the TTL
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create JetStream KV: %w", err)
+	}
+
+	e.taskKV = taskKV
+
+	workflowKV, err := e.storage.EnsureKV(e.ctx, jetstream.KeyValueConfig{
+		Bucket:      "workflows",
+		Description: "Workflow definition storage",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create JetStream KV: %w", err)
+	}
+
+	e.workflowKV = workflowKV
+	return nil
+}
+
+func (e *WorkflowEngine) Close() error {
+	return e.storage.Close()
+}
+
+// RegisterWorkflowDefinition registers a new workflow definition
+func (e *WorkflowEngine) RegisterWorkflowDefinition(def *types.WorkflowDefinition) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.isRunning {
-		return nil
+	// Validate definition
+	if err := e.validateWorkflowDefinition(def); err != nil {
+		return fmt.Errorf("invalid workflow definition: %w", err)
 	}
 
-	if e.natsConn == nil {
-		nc, err := nats.Connect(e.config.NatsURL)
-		if err != nil {
-			return fmt.Errorf("failed to connect to NATS: %w", err)
+	e.definitions[def.Name] = def
+	log.Printf("Registered workflow definition: %s (version: %s)", def.Name, def.Version)
+	return nil
+}
+
+func (e *WorkflowEngine) validateWorkflowDefinition(def *types.WorkflowDefinition) error {
+	if def.Name == "" {
+		return fmt.Errorf("workflow name is required")
+	}
+	if len(def.Activities) == 0 {
+		return fmt.Errorf("workflow must have at least one activity")
+	}
+
+	// Validate dependencies
+	activityNames := make(map[string]bool)
+	for _, activity := range def.Activities {
+		if activity.Name == "" {
+			return fmt.Errorf("activity name is required")
 		}
-		e.natsConn = nc
+		if activity.Type == "" {
+			return fmt.Errorf("activity type is required for %s", activity.Name)
+		}
+		activityNames[activity.Name] = true
 	}
 
-	// Start background workers
-	go e.processScheduledTasks(ctx)
-	go e.monitorWorkflowState(ctx)
-
-	// Set up NATS subscriptions for API requests and commands
-	// Subscribe to worker registration requests
-	if _, err := e.natsConn.Subscribe("WORKFLOW.Command.RegisterWorker", e.registerWorkerHandler); err != nil {
-		return fmt.Errorf("failed to subscribe to worker registrations: %w", err)
+	// Check that all dependencies exist
+	for _, activity := range def.Activities {
+		for _, dep := range activity.Dependencies {
+			if !activityNames[dep] {
+				return fmt.Errorf("activity %s depends on non-existent activity %s", activity.Name, dep)
+			}
+		}
 	}
-
-	// Additional subscriptions for API requests would go here
-	// nc.Subscribe("WORKFLOW.Api.StartWorkflow", e.handleStartWorkflow)
-	// nc.Subscribe("WORKFLOW.Api.GetResult", e.handleGetResult)
-
-	fmt.Println("Workflow engine started successfully")
-	e.isRunning = true
 
 	return nil
 }
 
-// Stop gracefully shuts down the workflow engine
-func (e *Engine) Stop() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if !e.isRunning {
-		return nil
-	}
-
-	// Signal all background workers to stop
-	close(e.stopCh)
-
-	if e.natsConn != nil {
-		e.natsConn.Close()
-	}
-
-	e.isRunning = false
-	fmt.Println("Workflow engine stopped")
-
-	return nil
-}
-
-// RegisterWorkflowType registers a new workflow definition with the engine
-// TODO: complete
-func (e *Engine) RegisterWorkflowType(workflowType string, definition interface{}) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if _, exists := e.workflows[workflowType]; exists {
-		// Overwrite existing definition
-		fmt.Printf("Overwriting existing workflow definition: %s\n", workflowType)
-	}
-
-	e.workflows[workflowType] = &model.WorkflowDefinition{
-		Type:         workflowType,
-		StateMachine: definition,
-		CreatedAt:    time.Now(),
-	}
-
-	fmt.Printf("Registered workflow type: %s\n", workflowType)
-	return nil
-}
-
-// RegisterTaskQueue registers a new task queue
-func (e *Engine) RegisterTaskQueue(name string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if _, exists := e.taskQueues[name]; exists {
-		return nil
-	}
-
-	e.taskQueues[name] = &TaskQueue{
-		Name: name,
-	}
-
-	fmt.Printf("Registered task queue: %s\n", name)
-	return nil
-}
-
-// StartWorkflow initiates a new workflow execution
-func (e *Engine) StartWorkflow(
-	ctx context.Context,
-	workflowType string,
-	workflowID string,
-	taskQueue string,
-	input interface{},
-) (string, error) {
+// StartWorkflow starts a new workflow instance
+func (e *WorkflowEngine) StartWorkflow(ctx context.Context, workflowName string, input map[string]any) (*types.WorkflowInstance, error) {
 	e.mu.RLock()
-	_, exists := e.workflows[workflowType]
-	if !exists {
-		e.mu.RUnlock()
-		return "", ErrWorkflowNotFound
-	}
-
-	_, queueExists := e.taskQueues[taskQueue]
+	def, exists := e.definitions[workflowName]
 	e.mu.RUnlock()
 
-	if !queueExists {
-		return "", ErrTaskQueueNotFound
+	if !exists {
+		return nil, fmt.Errorf("workflow definition not found: %s", workflowName)
 	}
 
-	// Generate a workflow ID if not provided
-	if workflowID == "" {
-		workflowID = uuid.New().String()
-	}
+	// Create workflow instance
+	workflowID := uuid.New().String()
+	now := time.Now()
 
-	// Generate a run ID for this execution
-	runID := uuid.New().String()
-
-	instance := &WorkflowInstance{
+	workflow := &types.WorkflowInstance{
 		ID:           workflowID,
-		RunID:        runID,
-		WorkflowType: workflowType,
-		Status:       WorkflowStatusCreated,
+		WorkflowName: workflowName,
+		State:        types.WorkflowStatePending,
 		Input:        input,
-		TaskQueue:    taskQueue,
-		StartedAt:    time.Now(),
-		History:      []HistoryEvent{},
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		Tasks:        make([]types.TaskInstance, 0),
 	}
 
-	// Add initial event to history
-	instance.History = append(instance.History, HistoryEvent{
-		EventType: "WorkflowExecutionStarted",
-		EventID:   1,
-		Timestamp: time.Now(),
-		Attributes: map[string]interface{}{
-			"workflowType": workflowType,
-			"taskQueue":    taskQueue,
-		},
-	})
-
-	// Store the new workflow instance
-	e.instanceMu.Lock()
-	if _, exists := e.workflowInstances[workflowID]; exists {
-		e.instanceMu.Unlock()
-		return "", ErrWorkflowAlreadyExists
-	}
-	e.workflowInstances[workflowID] = instance
-	e.instanceMu.Unlock()
-
-	// In a real implementation, persist the workflow state to NATS JetStream
-	key := fmt.Sprintf("WORKFLOW.State.%s", workflowID)
-	js, err := e.natsConn.JetStream()
-	if err != nil {
-		return "", ErrInvalidWorkflowState
-	}
-
-	js.Publish(key, encodeWorkflowState(instance))
-
-	// Schedule the first workflow task
-	workflowTask := &model.WorkflowTask{
-		TaskID:       uuid.New().String(),
-		WorkflowID:   workflowID,
-		RunID:        runID,
-		WorkflowType: workflowType,
-		TaskType:     "WorkflowExecutionTask",
-		Input:        input,
-		ScheduledAt:  time.Now(),
-	}
-
-	taskQueueSubject := fmt.Sprintf("WORKFLOW.TaskQueue.%s", taskQueue)
-	e.natsConn.Publish(taskQueueSubject, encodeTask(workflowTask))
-
-	fmt.Printf("Started workflow %s (ID: %s, Run: %s) on queue %s\n",
-		workflowType, workflowID, runID, taskQueue)
-
-	// Update status
-	e.updateWorkflowStatus(workflowID, WorkflowStatusRunning)
-
-	return runID, nil
-}
-
-// GetWorkflowResult retrieves the result or error of a workflow execution
-func (e *Engine) GetWorkflowResult(workflowID string) (interface{}, error) {
-	e.instanceMu.RLock()
-	instance, exists := e.workflowInstances[workflowID]
-	e.instanceMu.RUnlock()
-
-	if !exists {
-		// In a real implementation, try to load from NATS JetStream first
-		// key := fmt.Sprintf("WORKFLOW.State.%s", workflowID)
-		// msg, err := e.natsConn.JetStream().GetMsg(key)
-		// if err != nil {
-		//     return nil, ErrWorkflowNotFound
-		// }
-		// instance = decodeWorkflowState(msg.Data)
-
-		return nil, ErrWorkflowNotFound
-	}
-
-	// Check if the workflow is completed
-	if instance.Status == WorkflowStatusCompleted {
-		return instance.Result, nil
-	} else if instance.Status == WorkflowStatusFailed {
-		if instance.Error != nil {
-			return nil, instance.Error
+	// Create task instances
+	for _, activityDef := range def.Activities {
+		task := types.TaskInstance{
+			ID:           uuid.New().String(),
+			WorkflowID:   workflowID,
+			ActivityName: activityDef.Name,
+			ActivityType: activityDef.Type,
+			State:        types.TaskStatePending,
+			Input:        e.prepareTaskInput(activityDef.Input, input),
+			RetryCount:   0,
+			MaxRetries:   activityDef.RetryPolicy.MaxRetries,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		}
-		return nil, fmt.Errorf("workflow execution failed")
-	} else if instance.Status == WorkflowStatusCanceled {
-		return nil, fmt.Errorf("workflow execution was canceled")
-	} else if instance.Status == WorkflowStatusTerminated {
-		return nil, fmt.Errorf("workflow execution was terminated")
+		workflow.Tasks = append(workflow.Tasks, task)
 	}
 
-	// Workflow is still running
-	return nil, fmt.Errorf("workflow execution is still in progress: %s", instance.Status)
+	// Save workflow
+	if err := e.saveWorkflow(workflow); err != nil {
+		return nil, fmt.Errorf("failed to save workflow: %w", err)
+	}
+
+	// Start workflow execution
+	if err := e.executeNextTasks(workflow); err != nil {
+		return nil, fmt.Errorf("failed to start workflow execution: %w", err)
+	}
+
+	log.Printf("[ENGINE] Started workflow %s with ID %s", workflowName, workflowID)
+	return workflow, nil
 }
 
-// CompleteWorkflowTask processes the result of a workflow task
-func (e *Engine) CompleteWorkflowTask(taskID string, workflowID string, result interface{}, err error) error {
-	e.instanceMu.Lock()
-	defer e.instanceMu.Unlock()
+func (e *WorkflowEngine) prepareTaskInput(activityInput, workflowInput map[string]any) map[string]any {
+	result := make(map[string]any)
 
-	instance, exists := e.workflowInstances[workflowID]
-	if !exists {
-		return ErrWorkflowNotFound
+	// Copy activity input
+	maps.Copy(result, activityInput)
+
+	// Add workflow input
+	maps.Copy(result, workflowInput)
+
+	return result
+}
+
+func (e *WorkflowEngine) executeNextTasks(workflow *types.WorkflowInstance) error {
+	// Find tasks that are ready to execute (dependencies satisfied)
+	readyTasks := e.findReadyTasks(workflow)
+
+	if len(readyTasks) == 0 {
+		// Check if workflow is complete
+		if e.isWorkflowComplete(workflow) {
+			return e.completeWorkflow(e.ctx, workflow)
+		}
+		return nil
 	}
 
-	if err != nil {
-		// Task failed, update workflow status and record error
-		instance.Status = WorkflowStatusFailed
-		instance.Error = err
-		instance.CompletedAt = time.Now()
+	// Update workflow state to running
+	workflow.State = types.WorkflowStateRunning
+	workflow.UpdatedAt = time.Now()
 
-		// Add event to history
-		instance.History = append(instance.History, HistoryEvent{
-			EventType: "WorkflowExecutionFailed",
-			EventID:   int64(len(instance.History) + 1),
-			Timestamp: time.Now(),
-			Attributes: map[string]interface{}{
-				"error": err.Error(),
-			},
-		})
-	} else {
-		// Check if this is the final result
-		isFinal := true // In a real implementation, this would be determined by the task result
-
-		if isFinal {
-			// Final task completed, update workflow status and record result
-			instance.Status = WorkflowStatusCompleted
-			instance.Result = result
-			instance.CompletedAt = time.Now()
-
-			// Add event to history
-			instance.History = append(instance.History, HistoryEvent{
-				EventType: "WorkflowExecutionCompleted",
-				EventID:   int64(len(instance.History) + 1),
-				Timestamp: time.Now(),
-			})
-		} else {
-			// Not final, schedule next task based on workflow state machine
-			// This would create and schedule the next WorkflowTask
-			// For simplicity, this is not implemented here
-
-			// Add event to history
-			instance.History = append(instance.History, HistoryEvent{
-				EventType: "WorkflowTaskCompleted",
-				EventID:   int64(len(instance.History) + 1),
-				Timestamp: time.Now(),
-			})
+	// Dispatch ready tasks
+	for _, task := range readyTasks {
+		if err := e.dispatchTask(e.ctx, workflow, task); err != nil {
+			log.Printf("Failed to dispatch task %s: %v", task.ID, err)
+			continue
 		}
 	}
 
-	// In a real implementation, persist the updated state to NATS JetStream
-	// key := fmt.Sprintf("WORKFLOW.State.%s", workflowID)
-	// e.natsConn.JetStream().Publish(key, encodeWorkflowState(instance))
+	// Save updated workflow
+	return e.saveWorkflow(workflow)
+}
 
+func (e *WorkflowEngine) findReadyTasks(workflow *types.WorkflowInstance) []*types.TaskInstance {
+	e.mu.RLock()
+	def := e.definitions[workflow.WorkflowName]
+	e.mu.RUnlock()
+
+	var readyTasks []*types.TaskInstance
+
+	for i := range workflow.Tasks {
+		task := &workflow.Tasks[i]
+		if task.State != types.TaskStatePending {
+			continue
+		}
+
+		// Find activity definition
+		var activityDef *types.ActivityDefinition
+		for j := range def.Activities {
+			if def.Activities[j].Name == task.ActivityName {
+				activityDef = &def.Activities[j]
+				break
+			}
+		}
+
+		if activityDef == nil {
+			continue
+		}
+
+		// Check if all dependencies are satisfied
+		if e.areDependenciesSatisfied(workflow, activityDef.Dependencies) {
+			readyTasks = append(readyTasks, task)
+		}
+	}
+
+	return readyTasks
+}
+
+// Simple check whether an activity is ready to be executed
+// Check if it's dependent tasks/activities are completed
+func (e *WorkflowEngine) areDependenciesSatisfied(workflow *types.WorkflowInstance, dependencies []string) bool {
+	if len(dependencies) == 0 {
+		return true
+	}
+
+	for _, depName := range dependencies {
+		found := false
+		for _, task := range workflow.Tasks {
+			if task.ActivityName == depName && task.State == types.TaskStateCompleted {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (e *WorkflowEngine) isWorkflowComplete(workflow *types.WorkflowInstance) bool {
+	for _, task := range workflow.Tasks {
+		if task.State != types.TaskStateCompleted && task.State != types.TaskStateFailed {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *WorkflowEngine) completeWorkflow(ctx context.Context, workflow *types.WorkflowInstance) error {
+	// Check if any tasks failed
+	for _, task := range workflow.Tasks {
+		if task.State == types.TaskStateFailed {
+			workflow.State = types.WorkflowStateFailed
+			workflow.Error = fmt.Sprintf("Task %s failed: %s", task.ActivityName, task.Error)
+			now := time.Now()
+			workflow.CompletedAt = &now
+			workflow.UpdatedAt = now
+			return e.saveWorkflow(workflow)
+		}
+	}
+
+	// All tasks completed successfully
+	workflow.State = types.WorkflowStateCompleted
+	now := time.Now()
+	workflow.CompletedAt = &now
+	workflow.UpdatedAt = now
+
+	// Collect outputs from tasks
+	workflow.Output = make(map[string]any)
+	for _, task := range workflow.Tasks {
+		for k, v := range task.Output {
+			workflow.Output[k] = v
+		}
+	}
+
+	log.Printf("Workflow %s completed successfully", workflow.ID)
+	return e.saveWorkflow(workflow)
+}
+
+func (e *WorkflowEngine) dispatchTask(ctx context.Context, workflow *types.WorkflowInstance, task *types.TaskInstance) error {
+	// Update task state
+	task.State = types.TaskStateRunning
+	task.UpdatedAt = time.Now()
+
+	// Create task message
+	taskMsg := &types.TaskMessage{
+		TaskID:       task.ID,
+		WorkflowID:   task.WorkflowID,
+		ActivityName: task.ActivityName,
+		ActivityType: task.ActivityType,
+		Input:        task.Input,
+		Timeout:      30 * time.Second, // Default timeout
+		RetryCount:   task.RetryCount,
+		MaxRetries:   task.MaxRetries,
+	}
+
+	// Serialize and publish
+	data, err := taskMsg.ToJSON()
+	if err != nil {
+		return fmt.Errorf("failed to serialize task message: %w", err)
+	}
+
+	// Use subject pattern that will be matched by worker filters
+	// Format: workflow.tasks.{activity_type} to allow for more specific filtering if needed
+	subject := fmt.Sprintf("%s.%s", TaskQueueSubject, task.ActivityType)
+	_, err = e.storage.JetStream().Publish(ctx, subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish task: %w", err)
+	}
+
+	log.Printf("[ENGINE] Dispatched task %s (%s) for workflow %s", task.ID, task.ActivityName, workflow.ID)
 	return nil
 }
 
-// Internal method to update a workflow's status
-func (e *Engine) updateWorkflowStatus(workflowID string, status WorkflowStatus) {
-	e.instanceMu.Lock()
-	defer e.instanceMu.Unlock()
-
-	if instance, exists := e.workflowInstances[workflowID]; exists {
-		instance.Status = status
-
-		// In a real implementation, persist the updated state to NATS JetStream
-		// key := fmt.Sprintf("WORKFLOW.State.%s", workflowID)
-		// e.natsConn.JetStream().Publish(key, encodeWorkflowState(instance))
+// processResults processes task results from workers
+func (e *WorkflowEngine) processResults() {
+	consumer, err := e.resultStream.CreateOrUpdateConsumer(e.ctx, jetstream.ConsumerConfig{
+		Name:          ResultConsumerName,
+		Durable:       ResultConsumerName,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		MaxAckPending: 100,
+	})
+	if err != nil {
+		log.Printf("Failed to create result consumer: %v", err)
+		return
 	}
-}
 
-// Background worker to process scheduled tasks
-func (e *Engine) processScheduledTasks(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-e.stopCh:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// In a real implementation, this would check for scheduled tasks
-			// and dispatch them to appropriate task queues
-			// fmt.Println("Processing scheduled tasks...")
+	msgs, err := consumer.Consume(func(msg jetstream.Msg) {
+		if err := e.handleTaskResult(msg); err != nil {
+			log.Printf("Failed to handle task result: %v", err)
+			msg.Nak()
+		} else {
+			msg.Ack()
 		}
+	})
+	if err != nil {
+		log.Printf("Failed to start consuming results: %v", err)
+		return
 	}
+
+	// Wait for context cancellation
+	<-e.ctx.Done()
+	msgs.Stop()
 }
 
-// Background worker to monitor workflow states and handle timeouts
-func (e *Engine) monitorWorkflowState(ctx context.Context) {
-	ticker := time.NewTicker(e.config.StateCheckInterval)
-	defer ticker.Stop()
+func (e *WorkflowEngine) handleTaskResult(msg jetstream.Msg) error {
+	result := types.TaskResult{}
+	if err := result.FromJSON(msg.Data()); err != nil {
+		return fmt.Errorf("failed to deserialize task result: %w", err)
+	}
 
-	for {
-		select {
-		case <-e.stopCh:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			e.instanceMu.RLock()
-			for id, instance := range e.workflowInstances {
-				if instance.Status == WorkflowStatusRunning {
-					// Check for timeouts or other state conditions
-					// This is simplified; in a real implementation, you'd have more logic
-					if time.Since(instance.StartedAt) > 24*time.Hour {
-						// Example: auto-timeout workflows running for too long
-						fmt.Printf("Workflow %s timed out after 24h\n", id)
-						e.instanceMu.RUnlock()
-						e.updateWorkflowStatus(id, WorkflowStatusFailed)
-						e.instanceMu.RLock()
-					}
+	log.Printf("[ENGINE] <DEBUG> %v\n", result.Debug())
+
+	// Get workflow
+	workflow, err := e.GetWorkflow(result.WorkflowID)
+	if err != nil {
+		return fmt.Errorf("failed to get workflow: %w", err)
+	}
+
+	// Find and update task
+	taskUpdated := false
+	for i := range workflow.Tasks {
+		task := &workflow.Tasks[i]
+		if task.ID == result.TaskID {
+			if result.Success {
+				task.State = types.TaskStateCompleted
+				task.Output = result.Output
+				now := time.Now()
+				task.CompletedAt = &now
+			} else {
+				task.Error = result.Error
+				if task.RetryCount < task.MaxRetries {
+					task.State = types.TaskStateRetrying
+					task.RetryCount++
+				} else {
+					task.State = types.TaskStateFailed
+					now := time.Now()
+					task.CompletedAt = &now
 				}
 			}
-			e.instanceMu.RUnlock()
-		}
-	}
-}
-
-// registerWorkerHandler processes worker registration requests
-func (e *Engine) registerWorkerHandler(msg *nats.Msg) {
-	if msg.Reply == "" {
-		log.Printf("Received worker registration with no reply subject")
-		return
-	}
-
-	var registration struct {
-		WorkerID      string   `json:"workerId"`
-		TaskQueue     string   `json:"taskQueue"`
-		WorkflowTypes []string `json:"workflowTypes"`
-		ActivityTypes []string `json:"activityTypes"`
-		Timestamp     int64    `json:"timestamp"`
-	}
-
-	var response struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error,omitempty"`
-	}
-
-	// Parse registration request
-	if err := json.Unmarshal(msg.Data, &registration); err != nil {
-		response.Success = false
-		response.Error = fmt.Sprintf("Failed to parse registration: %v", err)
-		e.sendResponse(msg.Reply, response)
-		return
-	}
-
-	// Validate request
-	if registration.WorkerID == "" {
-		response.Success = false
-		response.Error = "Worker ID is required"
-		e.sendResponse(msg.Reply, response)
-		return
-	}
-
-	if registration.TaskQueue == "" {
-		response.Success = false
-		response.Error = "Task queue is required"
-		e.sendResponse(msg.Reply, response)
-		return
-	}
-
-	// Check if task queue exists, create if it doesn't
-	e.mu.Lock()
-	if _, exists := e.taskQueues[registration.TaskQueue]; !exists {
-		e.taskQueues[registration.TaskQueue] = &TaskQueue{
-			Name:    registration.TaskQueue,
-			Workers: []string{},
-		}
-		log.Printf("Created new task queue: %s", registration.TaskQueue)
-	}
-
-	// Register the worker
-	// worker := &RegisteredWorker{
-	// 	ID:            registration.WorkerID,
-	// 	TaskQueue:     registration.TaskQueue,
-	// 	Workflows:     registration.WorkflowTypes,
-	// 	Activities:    registration.ActivityTypes,
-	// 	RegisteredAt:  time.Now(),
-	// 	LastHeartbeat: time.Now(),
-	// }
-
-	// Add worker ID to task queue's workers list if not already there
-	taskQueue := e.taskQueues[registration.TaskQueue]
-	workerExists := false
-	for _, wid := range taskQueue.Workers {
-		if wid == registration.WorkerID {
-			workerExists = true
+			task.UpdatedAt = time.Now()
+			taskUpdated = true
 			break
 		}
 	}
 
-	if !workerExists {
-		taskQueue.Workers = append(taskQueue.Workers, registration.WorkerID)
-	}
-	e.mu.Unlock()
-
-	// Log the registration
-	log.Printf("Worker registered: %s on queue %s with %d workflow types and %d activity types",
-		registration.WorkerID, registration.TaskQueue, len(registration.WorkflowTypes), len(registration.ActivityTypes))
-
-	// Send successful response
-	response.Success = true
-	e.sendResponse(msg.Reply, response)
-
-	// Publish worker registration event
-	e.publishEvent("WorkerRegistered", map[string]interface{}{
-		"workerID":   registration.WorkerID,
-		"taskQueue":  registration.TaskQueue,
-		"workflows":  registration.WorkflowTypes,
-		"activities": registration.ActivityTypes,
-	})
-}
-
-// sendResponse sends a response to a NATS request
-func (e *Engine) sendResponse(subject string, payload interface{}) {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("Failed to marshal response: %v", err)
-		return
+	if !taskUpdated {
+		return fmt.Errorf("task not found: %s", result.TaskID)
 	}
 
-	if err := e.natsConn.Publish(subject, data); err != nil {
-		log.Printf("Failed to publish response to %s: %v", subject, err)
-	}
-}
-
-// publishEvent publishes an event to the WORKFLOW.Events subject
-func (e *Engine) publishEvent(eventType string, data map[string]interface{}) {
-	event := map[string]interface{}{
-		"type":      eventType,
-		"timestamp": time.Now().UnixNano(),
-		"data":      data,
+	// Save workflow
+	if err := e.saveWorkflow(workflow); err != nil {
+		return fmt.Errorf("failed to save workflow: %w", err)
 	}
 
-	eventData, err := json.Marshal(event)
-	if err != nil {
-		log.Printf("Failed to marshal event: %v", err)
-		return
+	// Continue workflow execution
+	if err := e.executeNextTasks(workflow); err != nil {
+		return fmt.Errorf("failed to continue workflow execution: %w", err)
 	}
 
-	subject := fmt.Sprintf("WORKFLOW.Events.%s", eventType)
-	if err := e.natsConn.Publish(subject, eventData); err != nil {
-		log.Printf("Failed to publish event: %v", err)
-	}
-}
-
-// dispatchWorkflowTask dispatches a workflow task to an appropriate worker
-func (e *Engine) dispatchWorkflowTask(ctx context.Context, task *model.WorkflowTask, taskQueue string) error {
-	e.mu.RLock()
-	queue, exists := e.taskQueues[taskQueue]
-	e.mu.RUnlock()
-
-	if !exists || len(queue.Workers) == 0 {
-		return fmt.Errorf("no workers available for task queue: %s", taskQueue)
-	}
-
-	// Serialize the task
-	taskData, err := json.Marshal(task)
-	if err != nil {
-		return fmt.Errorf("failed to marshal workflow task: %w", err)
-	}
-
-	// Create subject for the task queue
-	subject := fmt.Sprintf("WORKFLOW.TaskQueue.%s.Workflow", taskQueue)
-
-	// Set up context with timeout
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	// Send task to a worker through NATS with request-reply pattern
-	resp, err := e.natsConn.RequestWithContext(reqCtx, subject, taskData)
-	if err != nil {
-		return fmt.Errorf("failed to dispatch workflow task: %w", err)
-	}
-
-	// Process response to see if task was accepted
-	var taskResponse TaskResult
-	if err := json.Unmarshal(resp.Data, &taskResponse); err != nil {
-		return fmt.Errorf("failed to unmarshal task response: %w", err)
-	}
-
-	if taskResponse.Error != "" {
-		return fmt.Errorf("task dispatch rejected: %s", taskResponse.Error)
-	}
-
-	// Task was accepted, wait for result asynchronously
-	go e.waitForTaskResult(ctx, task.TaskID, task.WorkflowID)
-
+	log.Printf("[ENGINE] Processed result for task %s in workflow %s", result.TaskID, result.WorkflowID)
 	return nil
 }
 
-// waitForTaskResult waits for a task result to be published
-func (e *Engine) waitForTaskResult(ctx context.Context, taskID string, workflowID string) {
-	// Result subject
-	resultSubject := fmt.Sprintf("WORKFLOW.TaskResult.%s", taskID)
+func (e *WorkflowEngine) saveWorkflow(workflow *types.WorkflowInstance) error {
+	data, err := workflow.ToJSON()
+	if err != nil || data == nil {
+		return fmt.Errorf("error serializing data %v: %w", data, err)
+	}
+	e.workflowKV.Put(e.ctx, workflow.ID, data)
+	return nil
+}
 
-	// Set up subscription for result
-	var sub *nats.Subscription
-	var err error
-	sub, err = e.natsConn.Subscribe(resultSubject, func(msg *nats.Msg) {
-		var result TaskResult
-		if err := json.Unmarshal(msg.Data, &result); err != nil {
-			log.Printf("Failed to unmarshal task result: %v", err)
-			return
-		}
+// GetWorkflow retrieves a workflow by ID
+func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance, error) {
+	entry, err := e.workflowKV.Get(e.ctx, workflowID)
 
-		// Process the task result
-		log.Printf("Received result for task %s (workflow %s)", taskID, workflowID)
-
-		// In a real implementation, this would update the workflow state
-		// For now we'll just complete the workflow with this result
-		e.CompleteWorkflowTask(taskID, workflowID, result.Result, nil)
-
-		// Auto-unsubscribe after receiving the result
-		sub.Unsubscribe()
-	})
-
-	if err != nil {
-		log.Printf("Failed to subscribe to task result: %v", err)
-		return
+	if err != nil || entry == nil || entry.Value() == nil {
+		return nil, fmt.Errorf("error retrieving workflow %v instance: %w", workflowID, err)
 	}
 
-	// Set up cleanup when context is done
-	go func() {
-		select {
-		case <-ctx.Done():
-			sub.Unsubscribe()
+	instance := &types.WorkflowInstance{}
+	err = instance.FromJSON(entry.Value())
+	return instance, err
+}
+
+// ListWorkflows retrieves all workflows
+func (e *WorkflowEngine) ListWorkflows() ([]*types.WorkflowInstance, error) {
+
+	keyLister, err := e.workflowKV.ListKeys(e.ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching key list: %w", err)
+	}
+
+	var result []*types.WorkflowInstance
+	for k := range keyLister.Keys() {
+		v, err := e.GetWorkflow(k)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching key list: %w", err)
 		}
-	}()
+
+		result = append(result, v)
+	}
+
+	return result, nil
 }
