@@ -109,11 +109,10 @@ func (w *Worker) Start() error {
 		return fmt.Errorf("failed to get task stream: %w", err)
 	}
 
-	// Create consumer
-	consumerName := fmt.Sprintf("worker-%s", w.workerID)
+	// Create pull consumer to achieve Competing consumer pattern
 	consumer, err := w.nc.EnsureConsumer(w.ctx, "TASKS", jetstream.ConsumerConfig{
-		Name:          consumerName,
-		Durable:       consumerName,
+		Name:          "worker-consumer",
+		Durable:       "worker-consumer",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		MaxAckPending: w.concurrency,
@@ -127,6 +126,8 @@ func (w *Worker) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create consumer: %w", err)
 	}
+
+	log.Printf("Worker %v fetching from %s\n", w.workerID, consumer.CachedInfo().Name)
 
 	// Start consuming messages
 	msgs, err := consumer.Consume(func(msg jetstream.Msg) {
@@ -207,13 +208,13 @@ func (w *Worker) sendTaskResult(taskID, workflowID string, success bool, output 
 
 	data, err := result.ToJSON()
 	if err != nil {
-		log.Printf("Failed to serialize task result: %v", err)
+		log.Printf("[WORKER] Failed to serialize task result: %v", err)
 		return
 	}
 
 	_, err = w.nc.JetStream().Publish(w.ctx, engine.ResultQueueSubject, data)
 	if err != nil {
-		log.Printf("Failed to publish task result: %v", err)
+		log.Printf("[WORKER] Failed to publish task result: %v", err)
 		return
 	}
 }

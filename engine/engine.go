@@ -384,7 +384,7 @@ func (e *WorkflowEngine) dispatchTask(ctx context.Context, workflow *types.Workf
 	// Serialize and publish
 	data, err := taskMsg.ToJSON()
 	if err != nil {
-		return fmt.Errorf("failed to serialize task message: %w", err)
+		return fmt.Errorf("[ENGINE] failed to serialize task message: %w", err)
 	}
 
 	// Use subject pattern that will be matched by worker filters
@@ -392,7 +392,7 @@ func (e *WorkflowEngine) dispatchTask(ctx context.Context, workflow *types.Workf
 	subject := fmt.Sprintf("%s.%s", TaskQueueSubject, task.ActivityType)
 	_, err = e.storage.JetStream().Publish(ctx, subject, data)
 	if err != nil {
-		return fmt.Errorf("failed to publish task: %w", err)
+		return fmt.Errorf("[ENGINE] failed to publish task: %w", err)
 	}
 
 	log.Printf("[ENGINE] Dispatched task %s (%s) for workflow %s", task.ID, task.ActivityName, workflow.ID)
