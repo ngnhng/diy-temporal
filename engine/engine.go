@@ -31,7 +31,7 @@ type WorkflowEngine struct {
 	taskStream   jetstream.Stream
 	resultStream jetstream.Stream
 	taskKV       jetstream.KeyValue
-	// Holds workflow definitions, engine API Writes here, Orchestrator reads here
+	// Holds workflow instance statuses, engine API Writes here, Orchestrator reads here
 	workflowKV jetstream.KeyValue
 }
 
@@ -110,7 +110,7 @@ func (e *WorkflowEngine) initializeKVs() error {
 
 	workflowKV, err := e.storage.EnsureKV(e.ctx, jetstream.KeyValueConfig{
 		Bucket:      "workflows",
-		Description: "Workflow definition storage",
+		Description: "Workflow instance status store",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create JetStream KV: %w", err)
@@ -254,6 +254,11 @@ func (e *WorkflowEngine) executeNextTasks(workflow *types.WorkflowInstance) erro
 	workflow.State = types.WorkflowStateRunning
 	workflow.UpdatedAt = time.Now()
 
+	// Prepare inputs for ready tasks with outputs from dependencies
+	for _, task := range readyTasks {
+		e.prepareTaskInputFromDependencies(workflow, task)
+	}
+
 	// Dispatch ready tasks
 	for _, task := range readyTasks {
 		if err := e.dispatchTask(e.ctx, workflow, task); err != nil {
@@ -322,6 +327,41 @@ func (e *WorkflowEngine) areDependenciesSatisfied(workflow *types.WorkflowInstan
 	}
 
 	return true
+}
+
+// prepareTaskInputFromDependencies merges outputs from dependency tasks into the task input
+func (e *WorkflowEngine) prepareTaskInputFromDependencies(workflow *types.WorkflowInstance, task *types.TaskInstance) {
+	e.mu.RLock()
+	def := e.definitions[workflow.WorkflowName]
+	e.mu.RUnlock()
+
+	// Find activity definition to get dependencies
+	var activityDef *types.ActivityDefinition
+	for _, act := range def.Activities {
+		if act.Name == task.ActivityName {
+			activityDef = &act
+			break
+		}
+	}
+
+	if activityDef == nil || len(activityDef.Dependencies) == 0 {
+		return
+	}
+
+	// Merge outputs from all dependencies
+	for _, depName := range activityDef.Dependencies {
+		for _, depTask := range workflow.Tasks {
+			if depTask.ActivityName == depName && depTask.State == types.TaskStateCompleted && depTask.Output != nil {
+				// Merge output from this dependency into the task input
+				for k, v := range depTask.Output {
+					// Don't override existing values unless they're empty interfaces
+					if _, exists := task.Input[k]; !exists {
+						task.Input[k] = v
+					}
+				}
+			}
+		}
+	}
 }
 
 func (e *WorkflowEngine) isWorkflowComplete(workflow *types.WorkflowInstance) bool {
