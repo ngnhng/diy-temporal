@@ -78,16 +78,16 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) EnsureKV(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
-	_, err := c.js.KeyValue(ctx, cfg.Bucket)
-	if err != nil {
+	kv, err := c.js.KeyValue(ctx, cfg.Bucket)
+	if err != nil || kv == nil {
 		if err == jetstream.ErrBucketNotFound {
-			kv, err := c.js.KeyValue(ctx, cfg.Bucket)
+			kv, err := c.js.CreateKeyValue(ctx, cfg)
 			if err != nil {
-				return nil, fmt.Errorf("failed to create KV: %v, %w", cfg.Bucket, err)
+				return nil, fmt.Errorf("failed to create new KV: %v, %w", cfg.Bucket, err)
 			}
 			return kv, nil
 		}
-		return nil, fmt.Errorf("failed to create KV: %v, %w", cfg.Bucket, err)
+		return nil, fmt.Errorf("failed to ensure KV: %v, %w", cfg.Bucket, err)
 	}
 
 	updatedKV, err := c.js.UpdateKeyValue(ctx, cfg)
@@ -141,9 +141,12 @@ func (c *Client) EnsureConsumer(ctx context.Context, streamName string, cfg jets
 		return nil, fmt.Errorf("failed to get stream %s for consumer creation: %w", streamName, err)
 	}
 
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, cfg)
+	consumer, err := stream.Consumer(ctx, cfg.Name)
 	if err != nil || consumer == nil {
-		return nil, fmt.Errorf("failed to create/update consumer %s on stream %s: %w", cfg.Name, streamName, err)
+		consumer, err = stream.CreateOrUpdateConsumer(ctx, cfg)
+		if err != nil || consumer == nil {
+			return nil, fmt.Errorf("failed to create/update consumer %s on stream %s: %w", cfg.Name, streamName, err)
+		}
 	}
 	return consumer, nil
 }
