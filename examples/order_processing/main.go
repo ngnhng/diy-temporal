@@ -169,6 +169,9 @@ func runWithGracefulShutdown(ctx context.Context, cancel context.CancelFunc, fn 
 		defer shutdownCancel()
 
 		select {
+		case <-ctx.Done():
+			log.Printf("[WORKER] Shutting down...")
+			return nil
 		case err := <-errChan:
 			return err
 		case <-shutdownCtx.Done():
