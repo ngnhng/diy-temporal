@@ -24,15 +24,14 @@ const (
 )
 
 type WorkflowEngine struct {
-	storage      *storage.Client
-	definitions  map[string]*types.WorkflowDefinition
-	mu           sync.RWMutex
-	ctx          context.Context
-	taskStream   jetstream.Stream
-	resultStream jetstream.Stream
-	taskKV       jetstream.KeyValue
-	// Holds workflow definitions, engine API Writes here, Orchestrator reads here
-	workflowKV jetstream.KeyValue
+	storage            *storage.Client
+	definitions        map[string]*types.WorkflowDefinition
+	mu                 sync.RWMutex
+	ctx                context.Context
+	taskStream         jetstream.Stream
+	resultStream       jetstream.Stream
+	taskKV             jetstream.KeyValue
+	workflowInstanceKV jetstream.KeyValue
 }
 
 // TODO: use some logging code that supports output logger detail (which line, fn, etc.)
@@ -110,13 +109,13 @@ func (e *WorkflowEngine) initializeKVs() error {
 
 	workflowKV, err := e.storage.EnsureKV(e.ctx, jetstream.KeyValueConfig{
 		Bucket:      "workflows",
-		Description: "Workflow definition storage",
+		Description: "Workflow instance status store",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create JetStream KV: %w", err)
 	}
 
-	e.workflowKV = workflowKV
+	e.workflowInstanceKV = workflowKV
 	return nil
 }
 
@@ -254,6 +253,11 @@ func (e *WorkflowEngine) executeNextTasks(workflow *types.WorkflowInstance) erro
 	workflow.State = types.WorkflowStateRunning
 	workflow.UpdatedAt = time.Now()
 
+	// Prepare inputs for ready tasks with outputs from dependencies
+	for _, task := range readyTasks {
+		e.prepareTaskInputFromDependencies(workflow, task)
+	}
+
 	// Dispatch ready tasks
 	for _, task := range readyTasks {
 		if err := e.dispatchTask(e.ctx, workflow, task); err != nil {
@@ -322,6 +326,44 @@ func (e *WorkflowEngine) areDependenciesSatisfied(workflow *types.WorkflowInstan
 	}
 
 	return true
+}
+
+// prepareTaskInputFromDependencies merges outputs from dependency tasks into the task input
+func (e *WorkflowEngine) prepareTaskInputFromDependencies(workflow *types.WorkflowInstance, task *types.TaskInstance) {
+	e.mu.RLock()
+	def := e.definitions[workflow.WorkflowName]
+	e.mu.RUnlock()
+
+	// Find activity definition to get dependencies
+	var activityDef *types.ActivityDefinition
+	for _, act := range def.Activities {
+		if act.Name == task.ActivityName {
+			activityDef = &act
+			break
+		}
+	}
+
+	if activityDef == nil || len(activityDef.Dependencies) == 0 {
+		return
+	}
+
+	if task.Input == nil {
+		task.Input = make(map[string]any, 0)
+	}
+
+	// Merge outputs from all dependencies
+	for _, depName := range activityDef.Dependencies {
+		for _, depTask := range workflow.Tasks {
+			if depTask.ActivityName == depName && depTask.State == types.TaskStateCompleted && depTask.Output != nil {
+				// Merge output from this dependency into the task input
+				for k, v := range depTask.Output {
+					if _, exists := task.Input[k]; !exists {
+						task.Input[k] = v
+					}
+				}
+			}
+		}
+	}
 }
 
 func (e *WorkflowEngine) isWorkflowComplete(workflow *types.WorkflowInstance) bool {
@@ -495,13 +537,13 @@ func (e *WorkflowEngine) saveWorkflow(workflow *types.WorkflowInstance) error {
 	if err != nil || data == nil {
 		return fmt.Errorf("error serializing data %v: %w", data, err)
 	}
-	e.workflowKV.Put(e.ctx, workflow.ID, data)
+	e.workflowInstanceKV.Put(e.ctx, workflow.ID, data)
 	return nil
 }
 
 // GetWorkflow retrieves a workflow by ID
 func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance, error) {
-	entry, err := e.workflowKV.Get(e.ctx, workflowID)
+	entry, err := e.workflowInstanceKV.Get(e.ctx, workflowID)
 
 	if err != nil || entry == nil || entry.Value() == nil {
 		return nil, fmt.Errorf("error retrieving workflow %v instance: %w", workflowID, err)
@@ -515,7 +557,7 @@ func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance
 // ListWorkflows retrieves all workflows
 func (e *WorkflowEngine) ListWorkflows() ([]*types.WorkflowInstance, error) {
 
-	keyLister, err := e.workflowKV.ListKeys(e.ctx, nil)
+	keyLister, err := e.workflowInstanceKV.ListKeys(e.ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching key list: %w", err)
 	}

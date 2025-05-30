@@ -119,7 +119,6 @@ func (w *Worker) Start() error {
 		AckWait:       30 * time.Second,
 		MaxDeliver:    3,
 		BackOff:       []time.Duration{1 * time.Second, 5 * time.Second, 10 * time.Second},
-		// Use wildcard filter that still gets all tasks
 		// For workqueue streams, each consumer must have a unique filter
 		FilterSubject: fmt.Sprintf("%s.>", engine.TaskQueueSubject),
 	})
