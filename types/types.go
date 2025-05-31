@@ -173,3 +173,154 @@ func (t *TaskMessage) Debug() string {
 	}
 	return string(data)
 }
+
+// ObservabilityEventType represents different types of observability events
+type ObservabilityEventType string
+
+const (
+	EventTypeWorkflowStarted    ObservabilityEventType = "workflow.started"
+	EventTypeWorkflowCompleted  ObservabilityEventType = "workflow.completed"
+	EventTypeWorkflowFailed     ObservabilityEventType = "workflow.failed"
+	EventTypeWorkflowTimeout    ObservabilityEventType = "workflow.timeout"
+	EventTypeActivityStarted    ObservabilityEventType = "activity.started"
+	EventTypeActivityCompleted  ObservabilityEventType = "activity.completed"
+	EventTypeActivityFailed     ObservabilityEventType = "activity.failed"
+	EventTypeActivityRetry      ObservabilityEventType = "activity.retry"
+	EventTypeActivityTimeout    ObservabilityEventType = "activity.timeout"
+	EventTypeEngineStarted      ObservabilityEventType = "engine.started"
+	EventTypeEngineStopped      ObservabilityEventType = "engine.stopped"
+	EventTypeWorkerRegistered   ObservabilityEventType = "worker.registered"
+	EventTypeWorkerDeregistered ObservabilityEventType = "worker.deregistered"
+)
+
+// ObservabilityEvent represents a lifecycle or audit event in the workflow system
+type ObservabilityEvent struct {
+	ID          string                 `json:"id"`
+	Type        ObservabilityEventType `json:"type"`
+	Timestamp   time.Time              `json:"timestamp"`
+	WorkflowID  string                 `json:"workflow_id,omitempty"`
+	ActivityID  string                 `json:"activity_id,omitempty"`
+	WorkerID    string                 `json:"worker_id,omitempty"`
+	ComponentID string                 `json:"component_id,omitempty"`
+	TraceID     string                 `json:"trace_id,omitempty"`
+	SpanID      string                 `json:"span_id,omitempty"`
+	Data        map[string]any         `json:"data,omitempty"`
+	Duration    *time.Duration         `json:"duration,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+}
+
+// MetricType represents different types of metrics
+type MetricType string
+
+const (
+	MetricTypeCounter   MetricType = "counter"
+	MetricTypeGauge     MetricType = "gauge"
+	MetricTypeHistogram MetricType = "histogram"
+	MetricTypeSummary   MetricType = "summary"
+)
+
+// ObservabilityMetric represents a performance metric or counter
+type ObservabilityMetric struct {
+	Name      string            `json:"name"`
+	Type      MetricType        `json:"type"`
+	Value     float64           `json:"value"`
+	Timestamp time.Time         `json:"timestamp"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Unit      string            `json:"unit,omitempty"`
+}
+
+// TraceSpan represents a distributed tracing span
+type TraceSpan struct {
+	TraceID   string            `json:"trace_id"`
+	SpanID    string            `json:"span_id"`
+	ParentID  string            `json:"parent_id,omitempty"`
+	Operation string            `json:"operation"`
+	Component string            `json:"component"`
+	StartTime time.Time         `json:"start_time"`
+	EndTime   *time.Time        `json:"end_time,omitempty"`
+	Duration  *time.Duration    `json:"duration,omitempty"`
+	Tags      map[string]string `json:"tags,omitempty"`
+	Logs      []TraceLog        `json:"logs,omitempty"`
+	Status    string            `json:"status"`
+	Error     string            `json:"error,omitempty"`
+}
+
+// TraceLog represents a log entry within a trace span
+type TraceLog struct {
+	Timestamp time.Time         `json:"timestamp"`
+	Fields    map[string]string `json:"fields"`
+}
+
+// StructuredLog represents a structured log entry
+type StructuredLog struct {
+	Timestamp  time.Time      `json:"timestamp"`
+	Level      string         `json:"level"`
+	Message    string         `json:"message"`
+	Component  string         `json:"component"`
+	WorkflowID string         `json:"workflow_id,omitempty"`
+	ActivityID string         `json:"activity_id,omitempty"`
+	WorkerID   string         `json:"worker_id,omitempty"`
+	TraceID    string         `json:"trace_id,omitempty"`
+	SpanID     string         `json:"span_id,omitempty"`
+	Fields     map[string]any `json:"fields,omitempty"`
+	Error      string         `json:"error,omitempty"`
+}
+
+// HealthStatus represents the health status of a component
+type HealthStatus struct {
+	ComponentID   string         `json:"component_id"`
+	ComponentType string         `json:"component_type"`
+	Status        string         `json:"status"` // "healthy", "degraded", "unhealthy"
+	Timestamp     time.Time      `json:"timestamp"`
+	Details       map[string]any `json:"details,omitempty"`
+	Checks        []HealthCheck  `json:"checks,omitempty"`
+}
+
+// HealthCheck represents an individual health check
+type HealthCheck struct {
+	Name     string        `json:"name"`
+	Status   string        `json:"status"`
+	Message  string        `json:"message,omitempty"`
+	Duration time.Duration `json:"duration"`
+}
+
+// JSON marshaling methods for observability types
+func (e *ObservabilityEvent) ToJSON() ([]byte, error) {
+	return json.Marshal(e)
+}
+
+func (e *ObservabilityEvent) FromJSON(data []byte) error {
+	return json.Unmarshal(data, e)
+}
+
+func (m *ObservabilityMetric) ToJSON() ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func (m *ObservabilityMetric) FromJSON(data []byte) error {
+	return json.Unmarshal(data, m)
+}
+
+func (s *TraceSpan) ToJSON() ([]byte, error) {
+	return json.Marshal(s)
+}
+
+func (s *TraceSpan) FromJSON(data []byte) error {
+	return json.Unmarshal(data, s)
+}
+
+func (l *StructuredLog) ToJSON() ([]byte, error) {
+	return json.Marshal(l)
+}
+
+func (l *StructuredLog) FromJSON(data []byte) error {
+	return json.Unmarshal(data, l)
+}
+
+func (h *HealthStatus) ToJSON() ([]byte, error) {
+	return json.Marshal(h)
+}
+
+func (h *HealthStatus) FromJSON(data []byte) error {
+	return json.Unmarshal(data, h)
+}
