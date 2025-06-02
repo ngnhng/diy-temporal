@@ -424,7 +424,7 @@ func (e *WorkflowEngine) dispatchTask(ctx context.Context, workflow *types.Workf
 	}
 
 	// Serialize and publish
-	data, err := taskMsg.ToJSON()
+	data, err := types.ToJSON(taskMsg)
 	if err != nil {
 		return fmt.Errorf("[ENGINE] failed to serialize task message: %w", err)
 	}
@@ -474,12 +474,13 @@ func (e *WorkflowEngine) processResults() {
 }
 
 func (e *WorkflowEngine) handleTaskResult(msg jetstream.Msg) error {
-	result := types.TaskResult{}
-	if err := result.FromJSON(msg.Data()); err != nil {
+	var result types.TaskResult
+	var err error
+	if result, err = types.FromJSON[types.TaskResult](msg.Data()); err != nil {
 		return fmt.Errorf("failed to deserialize task result: %w", err)
 	}
 
-	log.Printf("[ENGINE] <DEBUG> %v\n", result.Debug())
+	log.Printf("[ENGINE] <DEBUG> %v\n", types.Debug(result))
 
 	// Get workflow
 	workflow, err := e.GetWorkflow(result.WorkflowID)
@@ -533,7 +534,7 @@ func (e *WorkflowEngine) handleTaskResult(msg jetstream.Msg) error {
 }
 
 func (e *WorkflowEngine) saveWorkflow(workflow *types.WorkflowInstance) error {
-	data, err := workflow.ToJSON()
+	data, err := types.ToJSON(workflow)
 	if err != nil || data == nil {
 		return fmt.Errorf("error serializing data %v: %w", data, err)
 	}
@@ -549,9 +550,9 @@ func (e *WorkflowEngine) GetWorkflow(workflowID string) (*types.WorkflowInstance
 		return nil, fmt.Errorf("error retrieving workflow %v instance: %w", workflowID, err)
 	}
 
-	instance := &types.WorkflowInstance{}
-	err = instance.FromJSON(entry.Value())
-	return instance, err
+	var instance types.WorkflowInstance
+	instance, err = types.FromJSON[types.WorkflowInstance](entry.Value())
+	return &instance, err
 }
 
 // ListWorkflows retrieves all workflows

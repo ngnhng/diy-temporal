@@ -154,7 +154,8 @@ func (w *Worker) Stop() {
 func (w *Worker) handleTask(msg jetstream.Msg) {
 	// Parse task message
 	var taskMsg types.TaskMessage
-	if err := taskMsg.FromJSON(msg.Data()); err != nil {
+	var err error
+	if taskMsg, err = types.FromJSON[types.TaskMessage](msg.Data()); err != nil {
 		log.Printf("Failed to parse task message: %v", err)
 		msg.Nak()
 		return
@@ -205,7 +206,7 @@ func (w *Worker) sendTaskResult(taskID, workflowID string, success bool, output 
 		CompletedAt: time.Now(),
 	}
 
-	data, err := result.ToJSON()
+	data, err := types.ToJSON(result)
 	if err != nil {
 		log.Printf("[WORKER] Failed to serialize task result: %v", err)
 		return
